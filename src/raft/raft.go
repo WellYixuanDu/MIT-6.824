@@ -101,6 +101,8 @@ type Raft struct {
 	electionTimer  *time.Timer
 
 	applyCh chan ApplyMsg
+
+	applyCond *sync.Cond
 }
 
 //
@@ -191,6 +193,16 @@ func (rf *Raft) becomeLeader() {
 	rf.readySendEntries()
 }
 
+func (rf *Raft) needApply() bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.lastApplied < rf.commitIndex {
+		return true
+	} else {
+		return false
+	}
+}
+
 func (rf *Raft) encodeState() []byte {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
@@ -213,10 +225,12 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 {
 		return
 	}
-
+	MyPrint(rf, "the readPersist is used")
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
-
+	rf.mu.Lock()
+	LPrint(rf, "get the lock in readPersist")
+	defer rf.mu.Unlock()
 	d.Decode(&rf.currentTerm)
 	d.Decode(&rf.votedFor)
 	d.Decode(&rf.logBuffer)
@@ -284,7 +298,7 @@ func (rf *Raft) sendSanpshotToPeer(server int, args *InstallSnapshotArgs, reply 
 		return false
 	}
 	if reply.Term > rf.currentTerm {
-		MyPrint(rf, "InstallSnapshotReply.Term %v is bigger than rf.currentTerm %v", rf.currentTerm)
+		MyPrint(rf, "InstallSnapshotReply.Term %v is bigger than rf.currentTerm %v", reply.Term, rf.currentTerm)
 		rf.becomeFollower(reply.Term)
 	} else {
 		rf.nextIndex[server] = Max(rf.nextIndex[server], rf.getFirstLogIndex()+1)
@@ -511,30 +525,68 @@ type AppendEntriesReply struct {
 	ConflictTerm  int
 }
 
-func (rf *Raft) applyLog() {
-	rf.mu.Lock()
-	LPrint(rf, "get the lock in applyLog")
+// func (rf *Raft) applyLog() {
+// 	rf.mu.Lock()
+// 	LPrint(rf, "get the lock in applyLog")
 
-	commitIndex := rf.commitIndex
-	lastApplied := rf.lastApplied
+// 	commitIndex := rf.commitIndex
+// 	lastApplied := rf.lastApplied
 
-	var applyEntries = make([]LogEntry, rf.commitIndex-rf.lastApplied, rf.commitIndex-rf.lastApplied)
-	copy(applyEntries, rf.logBuffer[lastApplied+1-rf.getFirstLogIndex():commitIndex+1-rf.getFirstLogIndex()])
-	rf.mu.Unlock()
+// 	var applyEntries = make([]LogEntry, rf.commitIndex-rf.lastApplied, rf.commitIndex-rf.lastApplied)
+// 	copy(applyEntries, rf.logBuffer[lastApplied+1-rf.getFirstLogIndex():commitIndex+1-rf.getFirstLogIndex()])
+// 	rf.mu.Unlock()
 
-	//解锁后进行apply
-	for _, entry := range applyEntries {
-		rf.applyCh <- ApplyMsg{
-			CommandValid: true,
-			Command:      entry.Command,
-			CommandIndex: entry.Index,
+// 	//解锁后进行apply
+// 	for _, entry := range applyEntries {
+// 		rf.applyCh <- ApplyMsg{
+// 			CommandValid: true,
+// 			Command:      entry.Command,
+// 			CommandIndex: entry.Index,
+// 		}
+// 	}
+
+// 	rf.mu.Lock()
+// 	rf.lastApplied = Max(rf.lastApplied, commitIndex)
+// 	rf.mu.Unlock()
+// 	LPrint(rf, "release the lock in applyLog")
+// }
+
+func (rf *Raft) doApplyLog(applyCh chan ApplyMsg) {
+	rf.applyCond.L.Lock()
+	defer rf.applyCond.L.Unlock()
+	for rf.killed() == false {
+		for !rf.needApply() {
+			rf.applyCond.Wait()
+			if rf.killed() {
+				return
+			}
 		}
+		rf.mu.Lock()
+		MyPrint(rf, "ready to do ApplyLog, the rf.lastApplied is %v and the rf.commitIndex is %v", rf.lastApplied, rf.commitIndex)
+		if rf.lastApplied >= rf.commitIndex {
+			rf.mu.Unlock()
+			continue
+		}
+		firstIndex := rf.getFirstLogIndex()
+		commitIndex := rf.commitIndex
+		lastApplied := rf.lastApplied
+		var applyEntries = make([]LogEntry, commitIndex-lastApplied)
+		copy(applyEntries, rf.logBuffer[lastApplied+1-firstIndex:commitIndex+1-firstIndex])
+		rf.mu.Unlock()
+		//解锁后进行apply
+		for _, entry := range applyEntries {
+			rf.applyCh <- ApplyMsg{
+				CommandValid: true,
+				Command:      entry.Command,
+				CommandIndex: entry.Index,
+			}
+		}
+		rf.mu.Lock()
+		rf.lastApplied = Max(rf.lastApplied, commitIndex)
+		rf.mu.Unlock()
+		MyPrint(rf, "apply succeed, the rf.lastApplied is %v and the rf.commitIndex is %v", rf.lastApplied, rf.commitIndex)
+		LPrint(rf, "release the lock in applyLog")
 	}
-
-	rf.mu.Lock()
-	rf.lastApplied = Max(rf.lastApplied, commitIndex)
-	rf.mu.Unlock()
-	LPrint(rf, "release the lock in applyLog")
 }
 
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
@@ -652,7 +704,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if rf.commitIndex < args.LeaderCommit {
 		rf.commitIndex = Min(args.LeaderCommit, rf.getLastLogIndex())
 		MyPrint(rf, "commit succed,the commitIdex is %v", rf.commitIndex)
-		go rf.applyLog()
+		if rf.commitIndex > rf.lastApplied {
+			LPrint(rf, "ready to broadcast")
+			rf.applyCond.Broadcast()
+		}
+		//go rf.applyLog()
 	}
 	rf.persist()
 
@@ -661,12 +717,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+
 	//	MyPrint(rf, "wait for the append entries status")
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	if ok == false {
+		MyPrint(rf, "the appendEntries reply is false")
+		return false
+	}
 	LPrint(rf, "get the lock in sendAppendEntries")
 	if reply.Term > rf.currentTerm {
 		MyPrint(rf, "sendAppendEntries replt.Term is %v, bigger than rf.currentTerm %v", reply.Term, rf.currentTerm)
+		if rf.role == ROLE_LEADER {
+			rf.electionTimer.Reset(rf.getElectionTime())
+		}
 		rf.becomeFollower(reply.Term)
 	}
 	if rf.role != ROLE_LEADER || rf.currentTerm != args.Term {
@@ -683,7 +747,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 
 			// add term 不一致
 			if reply.Term != rf.currentTerm {
-				MyPrint(rf, "error ,the term has become the old")
+				MyPrint(rf, "error ,the term has become the old, reply.Term is %v, and the rf.currentTerm is %v", reply.Term, rf.currentTerm)
 
 				LPrint(rf, "release the lock in sendAppendEntries")
 				return false
@@ -698,7 +762,12 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 			if rf.logBuffer[majorityIndex-rf.getFirstLogIndex()].Term == rf.currentTerm && majorityIndex > rf.commitIndex {
 				rf.commitIndex = majorityIndex
 				MyPrint(rf, "leader commit succeed, the commitIndex is %v", rf.commitIndex)
-				go rf.applyLog()
+				//	go rf.applyLog()
+				if rf.commitIndex > rf.lastApplied {
+					LPrint(rf, "ready to broadcast")
+					rf.applyCond.Broadcast()
+				}
+
 			}
 		}
 
@@ -823,7 +892,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
-
+	rf.applyCond = sync.NewCond(&sync.Mutex{})
 	// logentry从下标索引为1的地方开始存储
 	rf.logBuffer = []LogEntry{}
 	rf.logBuffer = append(rf.logBuffer, LogEntry{nil, 0, 0})
@@ -834,12 +903,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.matchIndex = make([]int, len(peers))
 	rf.nextIndex = make([]int, len(peers))
 	rf.role = ROLE_FOLLOWER
+	rf.applyCh = applyCh
 
+	go rf.doApplyLog(applyCh)
 	rf.electionTimer = time.NewTimer(rf.getElectionTime())
 	rf.heartbeatTimer = time.NewTimer(rf.getHeartbeatTime())
-
-	// Your initialization code here (2A, 2B, 2C).
-	rf.applyCh = applyCh
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())

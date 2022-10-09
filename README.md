@@ -206,3 +206,26 @@ func (c *Coordinator) Report_task(req *TaskFinishedRequest, reply *TaskFinishedR
 	return nil
 }
 ```
+## lab2 Raft
+### 细节优化
+1. 在能跑过所有test的情况下，在2D中经常会出现 `test took longer than 120 seconds` 的问题，因此考虑对代码进行优化，分析提升性能。
+	- **异步apply的实现**
+		
+		原始阶段的apply只在更新commitIndex的两个过程后被另起一个线程调用，但在调用过程中，由于push到applyCh的这一过程不能加锁，因此可能会导致 `rf.lastApplied` 的更新有所延迟，进一步使得可能会有多个已被应用的 `entry` 被重复应用，进而导致资源的浪费。
+
+		因此，可以另起一个线程，单独管理 `apply` 的过程，尽管需要不断重复执行，但可以保证每一条日志会被不重复的 `push` 到 `applyCh` 中，且日志应用这一过程是最耗时的，因此，可以进行尝试。
+2. leader在发送appendEntries消息时，由于其他节点可能因为断开连接的原因，导致其他节点的 `Term` 高于当前leader节点的 `Term` ，使得leader收到回复后变为Follower角色。leader在改变角色后没有重置选举时间，因此导致该leader长时间无法发起投票，使得它身上所具有的信息难以与其他节点同步，导致发起多轮投票，降低性能。
+	- **解决方案**
+		
+		在leader收到高Term的回复时，在转化为Follower的同时进行选举时间的重置。
+3. 在readPersist的过程中没有进行加锁，导致发生race。
+	- **解决方案**
+
+		在这个过程中加锁来避免竞争。
+4. 当followers的 `nextIndex` 小于 leader快照记录后的第一条log时，需要进行快照信息的发送，这里发完快照信息后直接return了，使得没有对其余follower发送心跳，导致选举过程重新发生，降低性能。
+	- **解决方案**
+
+	增开 `if else` 的判断来进行区分。
+	
+
+todo: batch and pipeline; apply 异步优化

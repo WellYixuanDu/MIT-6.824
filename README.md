@@ -207,6 +207,16 @@ func (c *Coordinator) Report_task(req *TaskFinishedRequest, reply *TaskFinishedR
 }
 ```
 ## lab2 Raft
+### 任务说明
+该lab所完成的工作即是raft协议的复现过程，从领导选举、日志发送、持久化存储、快照实现这四个需求出发，一步步来复现完整的、并具有较好健壮性的raft协议。
+### raft理解
+raft是一种易于理解的共识算法，服务器集群中的机器往往是 `leader`、`follower`、`candidate` 这三种状态之一，正常情况下，有一个 `leader`来进行与上层应用的交互以及与其他服务器的消息同步、管理等行为，其余服务器节点的身份则为 `follower` ，负责对 `leader` 发来的消息做出响应以及回复；当 `leader` 断开连接或宕机等故障发生的时候，其他 `follower` 节点将根据自身的选举时间到时后根据一定的正确性规则开展领导选举，来保证整个集群的一致性。
+
+日志发送顾名思义则是将 `leader` 收到的log信息同步给其他 `follower` 节点，在这个过程中涉及到 `commitIndex、nextIndex、matchIndex` 等控制日志发送与接收的数据更新过程。
+
+持久化存储在这里并没有真正的与磁盘打交道，而是通过调用该lab提供的接口来实现需要持久化存储数据的保存以及将我们封装好的持久化函数进行正确位置调用的过程。
+
+快照实现主要是将当前的日志内容进行压缩为应用的切面数据并保存的过程，主要是为了解决因长时间运行而导致日志不断累积所占用大量的空间问题。
 ### 细节优化
 1. 在能跑过所有test的情况下，在2D中经常会出现 `test took longer than 120 seconds` 的问题，因此考虑对代码进行优化，分析提升性能。
 	- **异步apply的实现**
@@ -225,7 +235,10 @@ func (c *Coordinator) Report_task(req *TaskFinishedRequest, reply *TaskFinishedR
 4. 当followers的 `nextIndex` 小于 leader快照记录后的第一条log时，需要进行快照信息的发送，这里发完快照信息后直接return了，使得没有对其余follower发送心跳，导致选举过程重新发生，降低性能。
 	- **解决方案**
 
-	增开 `if else` 的判断来进行区分。
-	
+	增加 `if else` 的判断来进行区分。
+5. leader `crash` 后，集群经过一个 `Term` 选出新leader，并增加一个log后 `crash` 掉，之前的leader重新连接，并发起选举，使得 `Term` 刚好满足投票的要求，再次若再增加一个log的话，就会产生两个leader中的log索引相同且任期相同，但log内容不同的情况，引发问题。
+	- **解决方案（非完美）**
 
-todo: batch and pipeline; apply 异步优化
+		分析问题发现，在将 `crash` 掉的leader重新连接初始化的过程中，由于重新设置选举的时间放置在 `readPersist` 前面，因此导致在重新选举之后 经过`readPersist` 这个阶段后没多久便开始了发起选举投票，在这期间没有收到其他节点的同步包，因此导致上述问题的发生。
+
+		将两个顺序调换，给重连的leader以足够的时间接收其他节点发来的同步包。

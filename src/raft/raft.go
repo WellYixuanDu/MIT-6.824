@@ -236,6 +236,7 @@ func (rf *Raft) readPersist(data []byte) {
 	d.Decode(&rf.logBuffer)
 	rf.commitIndex = rf.getFirstLogIndex()
 	rf.lastApplied = rf.getFirstLogIndex()
+	MyPrint(rf, "readPersist the rf.commitIndex is %v and the lastApplied is %v and the currentTerm is %v", rf.commitIndex, rf.lastApplied, rf.currentTerm)
 }
 
 // ----------------------------- snapshot begin -------------------------------------------------
@@ -294,7 +295,7 @@ func (rf *Raft) sendSanpshotToPeer(server int, args *InstallSnapshotArgs, reply 
 	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if !ok {
+	if !ok || rf.currentTerm != args.Term {
 		return false
 	}
 	if reply.Term > rf.currentTerm {
@@ -441,9 +442,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		LPrint(rf, "release the lock in RequestVote")
 		return
 	}
-	rf.votedFor = args.CandidateId
+
 	MyPrint(rf, "getelectionTime in RequestVote")
 	rf.electionTimer.Reset(rf.getElectionTime())
+	rf.votedFor = args.CandidateId
 	reply.Term, reply.VoteGranted = rf.currentTerm, true
 	rf.persist()
 	MyPrint(rf, "vote successfully")
@@ -472,6 +474,13 @@ func (rf *Raft) leaderSelect() {
 			if rf.sendRequestVote(serveId, voteRequestArgs, reply) {
 				rf.mu.Lock()
 				defer rf.mu.Unlock()
+				if reply.Term > rf.currentTerm {
+					MyPrint(rf, "finds a node %v with the higher term %v, change the role to follower", serveId, reply.Term)
+					rf.becomeFollower(reply.Term)
+				}
+				if rf.role != ROLE_CANDIDATE || rf.currentTerm != voteRequestArgs.Term {
+					return
+				}
 				MyPrint(rf, "receives RequestVoteResponse %v from {Node %v} after sending RequestVoteRequest %v in term %v", reply, serveId, voteRequestArgs, rf.currentTerm)
 				if rf.currentTerm == reply.Term && rf.role == ROLE_CANDIDATE {
 					if reply.VoteGranted {
@@ -483,10 +492,11 @@ func (rf *Raft) leaderSelect() {
 							rf.becomeLeader()
 
 						}
-					} else if reply.Term > rf.currentTerm {
-						MyPrint(rf, "finds a node %v with the higher term %v, change the role to follower", serveId, reply.Term)
-						rf.becomeFollower(reply.Term)
 					}
+					// } else if reply.Term > rf.currentTerm {
+					// 	MyPrint(rf, "finds a node %v with the higher term %v, change the role to follower", serveId, reply.Term)
+					// 	rf.becomeFollower(reply.Term)
+					// }
 				}
 			}
 		}(serveId)
@@ -722,7 +732,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if ok == false {
-		MyPrint(rf, "the appendEntries reply is false")
+		//	MyPrint(rf, "the appendEntries reply is false")
 		return false
 	}
 	LPrint(rf, "get the lock in sendAppendEntries")
@@ -744,7 +754,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 		if rf.role == ROLE_LEADER {
 			// need to delete
 			//rf.electionTimer.Reset(rf.getElectionTime())
-
+			MyPrint(rf, "receive the appendentries, the reply is true")
 			// add term 不一致
 			if reply.Term != rf.currentTerm {
 				MyPrint(rf, "error ,the term has become the old, reply.Term is %v, and the rf.currentTerm is %v", reply.Term, rf.currentTerm)
@@ -755,7 +765,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 
 			rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
 			rf.nextIndex[server] = rf.matchIndex[server] + 1
-
+			MyPrint(rf, "The rf.matchIndex[server] is %v, the prevLogIndex is %v, the len(args.Entries) is %v", rf.matchIndex[server], args.PrevLogIndex, len(args.Entries))
 			majorityIndex := rf.getMajorityIndex()
 			//	MyPrint(rf, "the matchIndex is %v", rf.matchIndex)
 			//	MyPrint(rf, "Commit info: majorityIndex is %v, rf,logBuffer[majorityIndex].Term is %v, rf.currentTerm is %v, the rf.commitIndex is %v", majorityIndex, rf.logBuffer[majorityIndex].Term, rf.currentTerm, rf.commitIndex)
@@ -799,7 +809,6 @@ func (rf *Raft) readySendEntries() {
 			rf.nextIndex[serverID] = rf.getLastLogIndex() + 1
 			rf.matchIndex[serverID] = rf.getLastLogIndex()
 		} else {
-			// TODO： serverID断开连接，导致leader阻塞
 			if rf.nextIndex[serverID] <= rf.getFirstLogIndex() {
 				MyPrint(rf, "ready send snapshot to %v node", serverID)
 				args := InstallSnapshotArgs{
@@ -814,27 +823,29 @@ func (rf *Raft) readySendEntries() {
 				go rf.sendSanpshotToPeer(serverID, &args, &reply)
 				return
 
-			}
-			logLen := len(rf.logBuffer)
-			args := AppendEntriesArgs{
-				Term:         rf.currentTerm,
-				LeaderID:     rf.me,
-				PrevLogIndex: rf.nextIndex[serverID] - 1,
-				PrevLogTerm:  rf.logBuffer[rf.nextIndex[serverID]-1-rf.getFirstLogIndex()].Term,
-				Entries:      nil,
-				LeaderCommit: rf.commitIndex,
-			}
-			reply := AppendEntriesReply{}
+			} else {
+				logLen := len(rf.logBuffer)
+				args := AppendEntriesArgs{
+					Term:         rf.currentTerm,
+					LeaderID:     rf.me,
+					PrevLogIndex: rf.nextIndex[serverID] - 1,
+					PrevLogTerm:  rf.logBuffer[rf.nextIndex[serverID]-1-rf.getFirstLogIndex()].Term,
+					Entries:      nil,
+					LeaderCommit: rf.commitIndex,
+				}
+				reply := AppendEntriesReply{}
 
-			if rf.getLastLogIndex() >= rf.nextIndex[serverID] {
-				// args.PrevLogIndex = rf.nextIndex[serverID] - 1
-				// args.PrevLogTerm = rf.logBuffer[args.PrevLogIndex].Term
-				args.Entries = make([]LogEntry, rf.getLastLogIndex()-rf.nextIndex[serverID]+1)
-				copy(args.Entries, rf.logBuffer[(rf.nextIndex[serverID]-rf.getFirstLogIndex()):])
-				//	MyPrint(rf, "copy the entries is %v and the args.Entries is %v", rf.logBuffer[rf.nextIndex[serverID]:], args.Entries)
+				if rf.getLastLogIndex() >= rf.nextIndex[serverID] {
+					// args.PrevLogIndex = rf.nextIndex[serverID] - 1
+					// args.PrevLogTerm = rf.logBuffer[args.PrevLogIndex].Term
+					args.Entries = make([]LogEntry, rf.getLastLogIndex()-rf.nextIndex[serverID]+1)
+					copy(args.Entries, rf.logBuffer[(rf.nextIndex[serverID]-rf.getFirstLogIndex()):])
+					//	MyPrint(rf, "copy the entries is %v and the args.Entries is %v", rf.logBuffer[rf.nextIndex[serverID]:], args.Entries)
+				}
+				MyPrint(rf, "send entries process, the logLen is %v, the rf.nextIndex[%v] is %v, the log is %v", logLen, serverID, rf.nextIndex[serverID], rf.logBuffer)
+				go rf.sendAppendEntries(serverID, &args, &reply)
 			}
-			MyPrint(rf, "send entries process, the logLen is %v, the rf.nextIndex[%v] is %v, the log is %v", logLen, serverID, rf.nextIndex[serverID], rf.logBuffer)
-			go rf.sendAppendEntries(serverID, &args, &reply)
+
 		}
 	}
 	rf.heartbeatTimer.Reset(rf.getHeartbeatTime())
@@ -908,7 +919,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.doApplyLog(applyCh)
 	rf.electionTimer = time.NewTimer(rf.getElectionTime())
 	rf.heartbeatTimer = time.NewTimer(rf.getHeartbeatTime())
-
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
